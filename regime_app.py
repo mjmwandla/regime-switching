@@ -20,8 +20,15 @@ from sklearn.preprocessing import StandardScaler
 from hmmlearn.hmm import GaussianHMM
 from scipy.stats import nbinom, norm
 from scipy.optimize import minimize
+import io
+import os
 import warnings
 warnings.filterwarnings("ignore")
+
+_DATA_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "MSCI ACWI Monthly REturn CSV VIX_cleaned.csv",
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config
@@ -81,14 +88,26 @@ REGIME_COLOURS = {
 REGIME_NAMES_DEFAULT = {0: "Bull", 1: "Tranquil", 2: "Bear", 3: "Regime 4", 4: "Regime 5"}
 
 
+def hex_to_rgba(hex_colour: str, alpha: float = 0.5) -> str:
+    """Convert a hex colour string (e.g. '#2ecc71') to an rgba() string."""
+    h = hex_colour.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper: load & cache data
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data
 def load_data():
-    df = pd.read_csv(
-        "MSCI ACWI Monthly REturn CSV VIX_cleaned.csv"
-    )
+    try:
+        df = pd.read_csv(_DATA_PATH)
+    except FileNotFoundError:
+        st.error(
+            f"Data file not found at: {_DATA_PATH}\n"
+            "Please ensure the CSV is in the same folder as regime_app.py."
+        )
+        st.stop()
     df["Date"] = pd.to_datetime(df["Date"], dayfirst=True)
     df = df.sort_values("Date").reset_index(drop=True)
     df.columns = ["Date", "Return", "CSV", "VIX", "Turbulence"]
@@ -98,6 +117,7 @@ def load_data():
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper: fit GMM
 # ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner="Fitting GMM…")
 def fit_gmm(X_raw, n_components, cov_type, random_state=42, n_init=20):
     scaler = StandardScaler()
     X = scaler.fit_transform(X_raw)
@@ -127,6 +147,7 @@ def order_regimes_by_return(labels, returns):
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper: fit HMM / HSMM
 # ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner="Fitting HMM…")
 def fit_hmm(X_raw, n_components, n_iter=200, random_state=42):
     scaler = StandardScaler()
     X = scaler.fit_transform(X_raw)
@@ -170,7 +191,7 @@ def fit_negbin_durations(sojourns, n_components):
         mean_d = float(durs_arr.mean())
         var_d = float(durs_arr.var())
         if var_d <= mean_d:
-            var_d = mean_d + 0.1
+            var_d = mean_d * 1.1  # NegBin requires var > mean; 10% margin is scale-invariant
         p_hat = mean_d / var_d
         r_hat = mean_d * p_hat / (1 - p_hat)
         r_hat = max(r_hat, 0.5)
@@ -193,10 +214,10 @@ def hsmm_viterbi_duration(hmm_labels, negbin_params, n_components):
         if dur > 1:
             survival_prob = 1 - nbinom.cdf(dur, r, p)
             if survival_prob < 0.01 and dur > nb["mean"] * 2.5:
-                # This run is implausibly long — mark second half as uncertain
+                # Run is implausibly long — reassign second half to next regime
                 split = idx + dur // 2
-                # Leave first half, but don't forcibly change (just note)
-                pass
+                next_regime = (regime + 1) % n_components
+                refined[split: idx + dur] = next_regime
         idx += dur
 
     return refined
@@ -238,9 +259,22 @@ def compute_optimal_te(ic_k, csv_k, pi_k, te_total, te_floor):
 
 def simulate_paths(
     returns, regime_labels, ic_k, csv_k, pi_k,
-    te_fixed, te_dynamic, n_paths=500, seed=42
+    te_fixed, te_dynamic, n_paths=500, seed=42,
+    progress_callback=None,
 ):
-    """Monte-Carlo: generate n_paths by sampling regime sequences and returns."""
+    """Monte-Carlo: generate n_paths by sampling regime sequences and returns.
+
+    Units / dimensional contract
+    ----------------------------
+    ic_k   : decimal (e.g. 0.069 for 6.9% IC)
+    csv_k  : cross-sectional volatility in the same units as returns column
+    te_fixed / te_dynamic : annualised tracking error in %; divided by 100
+                            inside this function to obtain a decimal fraction
+    theta_k = IC × CSV    : expected active return per unit of TE (per period)
+    alpha per period      : theta_k × (TE / 100)
+    noise std per period  : (TE / 100) × 0.5  — represents unexplained active-
+                            return variance (the non-IC component of TE)
+    """
     rng = np.random.RandomState(seed)
     K = len(ic_k)
     T = len(returns)
@@ -258,13 +292,17 @@ def simulate_paths(
 
     results_fixed = []
     results_dynamic = []
+    ts_fixed = []    # shape (n_paths, T) — cumulative alpha at each period
+    ts_dynamic = []
 
-    for _ in range(n_paths):
+    for i in range(n_paths):
         # Random regime sequence (draw from stationary probabilities)
         regimes = rng.choice(K, size=T, p=pi_k)
 
         cum_fixed = 0.0
         cum_dynamic = 0.0
+        cum_fixed_series = []
+        cum_dynamic_series = []
 
         for t in range(T):
             k = regimes[t]
@@ -280,11 +318,22 @@ def simulate_paths(
 
             cum_fixed += alpha_fixed
             cum_dynamic += alpha_dynamic
+            cum_fixed_series.append(cum_fixed)
+            cum_dynamic_series.append(cum_dynamic)
 
         results_fixed.append(cum_fixed)
         results_dynamic.append(cum_dynamic)
+        ts_fixed.append(cum_fixed_series)
+        ts_dynamic.append(cum_dynamic_series)
+        if progress_callback is not None:
+            progress_callback((i + 1) / n_paths)
 
-    return np.array(results_fixed), np.array(results_dynamic)
+    return (
+        np.array(results_fixed),
+        np.array(results_dynamic),
+        np.array(ts_fixed),    # (n_paths, T)
+        np.array(ts_dynamic),  # (n_paths, T)
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -540,7 +589,7 @@ with tab1:
             x=df["Date"], y=probs_ordered[:, k],
             mode="lines", fill="tonexty" if k > 0 else "tozeroy",
             name=regime_names[k], line=dict(width=0.5),
-            fillcolor=REGIME_COLOURS[k].replace(")", ",0.5)").replace("rgb", "rgba") if "rgb" in REGIME_COLOURS[k] else None,
+            fillcolor=hex_to_rgba(REGIME_COLOURS[k], 0.5),
             stackgroup="one",
         ))
     fig_prob.update_layout(height=350, yaxis_title="Probability", yaxis_range=[0, 1])
@@ -908,10 +957,18 @@ with tab3:
     st.subheader("Monte-Carlo Simulation")
     st.markdown(f"Simulating **{n_simulations}** market paths to test the strategy...")
 
-    results_fixed, results_dynamic = simulate_paths(
+    _progress = st.progress(0, text="Starting simulation...")
+
+    def _update(frac):
+        n_done = int(frac * n_simulations)
+        _progress.progress(frac, text=f"Simulating path {n_done} / {n_simulations}…")
+
+    results_fixed, results_dynamic, ts_fixed, ts_dynamic = simulate_paths(
         df["Return"].values, labels_for_te, ic_values, csv_actual, pi_actual,
-        te_fixed, te_star, n_paths=n_simulations, seed=42
+        te_fixed, te_star, n_paths=n_simulations, seed=42,
+        progress_callback=_update,
     )
+    _progress.empty()
 
     win_rate = (results_dynamic > results_fixed).mean()
 
@@ -919,6 +976,14 @@ with tab3:
     sim_cols[0].metric("Win rate (Dynamic > Fixed)", f"{win_rate:.1%}")
     sim_cols[1].metric("Mean cumulative alpha (Dynamic)", f"{results_dynamic.mean():.4f}")
     sim_cols[2].metric("Mean cumulative alpha (Fixed)", f"{results_fixed.mean():.4f}")
+
+    p5_d, p95_d = np.percentile(results_dynamic, [5, 95])
+    p5_f, p95_f = np.percentile(results_fixed, [5, 95])
+    pct_cols = st.columns(4)
+    pct_cols[0].metric("5th %ile (Dynamic)", f"{p5_d:.4f}")
+    pct_cols[1].metric("95th %ile (Dynamic)", f"{p95_d:.4f}")
+    pct_cols[2].metric("5th %ile (Fixed)", f"{p5_f:.4f}")
+    pct_cols[3].metric("95th %ile (Fixed)", f"{p95_f:.4f}")
 
     # Distribution of outcomes
     fig_mc = go.Figure()
@@ -944,6 +1009,104 @@ with tab3:
                               yaxis_title="Frequency",
                               title=f"Alpha Differential (Dynamic wins {win_rate:.0%} of paths)")
     st.plotly_chart(fig_ir_dist, use_container_width=True)
+
+    # ── Fan chart: path distribution over time ──
+    st.subheader("Cumulative Alpha Path Distribution Over Time")
+    st.markdown("Each band shows how the spread of outcomes widens as paths diverge. The median lines show the central tendency.")
+    months = np.arange(1, ts_dynamic.shape[1] + 1)
+    pct_d = np.percentile(ts_dynamic, [5, 25, 50, 75, 95], axis=0)
+    pct_f = np.percentile(ts_fixed,   [5, 25, 50, 75, 95], axis=0)
+
+    fig_fan = go.Figure()
+
+    # Dynamic outer band (5th–95th)
+    fig_fan.add_trace(go.Scatter(
+        x=np.concatenate([months, months[::-1]]),
+        y=np.concatenate([pct_d[4], pct_d[0][::-1]]),
+        fill='toself', fillcolor=hex_to_rgba('#2ecc71', 0.15),
+        line=dict(color='rgba(0,0,0,0)'),
+        name='Dynamic 5–95th %ile', legendgroup='dynamic',
+    ))
+    # Dynamic inner band (25th–75th)
+    fig_fan.add_trace(go.Scatter(
+        x=np.concatenate([months, months[::-1]]),
+        y=np.concatenate([pct_d[3], pct_d[1][::-1]]),
+        fill='toself', fillcolor=hex_to_rgba('#2ecc71', 0.35),
+        line=dict(color='rgba(0,0,0,0)'),
+        name='Dynamic 25–75th %ile', legendgroup='dynamic',
+    ))
+    # Dynamic median
+    fig_fan.add_trace(go.Scatter(
+        x=months, y=pct_d[2],
+        line=dict(color='#2ecc71', width=2),
+        name='Dynamic median', legendgroup='dynamic',
+    ))
+
+    # Fixed outer band (5th–95th)
+    fig_fan.add_trace(go.Scatter(
+        x=np.concatenate([months, months[::-1]]),
+        y=np.concatenate([pct_f[4], pct_f[0][::-1]]),
+        fill='toself', fillcolor=hex_to_rgba('#95a5a6', 0.15),
+        line=dict(color='rgba(0,0,0,0)'),
+        name='Fixed 5–95th %ile', legendgroup='fixed',
+    ))
+    # Fixed inner band (25th–75th)
+    fig_fan.add_trace(go.Scatter(
+        x=np.concatenate([months, months[::-1]]),
+        y=np.concatenate([pct_f[3], pct_f[1][::-1]]),
+        fill='toself', fillcolor=hex_to_rgba('#95a5a6', 0.35),
+        line=dict(color='rgba(0,0,0,0)'),
+        name='Fixed 25–75th %ile', legendgroup='fixed',
+    ))
+    # Fixed median
+    fig_fan.add_trace(go.Scatter(
+        x=months, y=pct_f[2],
+        line=dict(color='#7f8c8d', width=2),
+        name='Fixed median', legendgroup='fixed',
+    ))
+
+    fig_fan.add_hline(y=0, line_dash='dash', line_color='black', opacity=0.4)
+    fig_fan.update_layout(
+        height=450, xaxis_title='Month', yaxis_title='Cumulative Active Alpha',
+        title='Path Fan Chart — Green: Dynamic TE, Grey: Fixed TE',
+    )
+    st.plotly_chart(fig_fan, use_container_width=True)
+
+    # ── Download buttons ──
+    dl_col1, dl_col2 = st.columns(2)
+
+    sim_df = pd.DataFrame({
+        "path_id": range(1, len(results_dynamic) + 1),
+        "cumulative_alpha_dynamic": results_dynamic,
+        "cumulative_alpha_fixed": results_fixed,
+        "alpha_differential": results_dynamic - results_fixed,
+    })
+    buf = io.StringIO()
+    sim_df.to_csv(buf, index=False)
+    dl_col1.download_button(
+        "⬇ Download simulation results",
+        data=buf.getvalue(),
+        file_name="simulation_results.csv",
+        mime="text/csv",
+    )
+
+    gmm_labels_dl = st.session_state["gmm_labels"]
+    regime_df = pd.DataFrame({
+        "Date": df["Date"].dt.strftime("%Y-%m-%d"),
+        "Return": df["Return"],
+        "GMM_regime": gmm_labels_dl,
+        "GMM_regime_name": [regime_names[k] for k in gmm_labels_dl],
+        "HMM_regime": labels_for_te,
+        "HMM_regime_name": [regime_names[k] for k in labels_for_te],
+    })
+    buf2 = io.StringIO()
+    regime_df.to_csv(buf2, index=False)
+    dl_col2.download_button(
+        "⬇ Download regime classifications",
+        data=buf2.getvalue(),
+        file_name="regime_classifications.csv",
+        mime="text/csv",
+    )
 
     st.markdown("""
     <div class="explanation-box">
